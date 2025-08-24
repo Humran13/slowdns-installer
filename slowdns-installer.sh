@@ -12,7 +12,6 @@ NC='\033[0m'
 
 # Directories and files
 DNSTT_DIR="/opt/dnstt"
-BACKUP_DIR="/opt/dnstt-backup"
 CONFIG_DIR="/etc/dnstt"
 SERVICE_FILE="/etc/systemd/system/dnstt-server.service"
 
@@ -119,6 +118,19 @@ add_user() {
   echo -e "${GREEN}User ${USERNAME} added for Dropbear SSH.${NC}"
 }
 
+# Function to remove a user
+remove_user() {
+  echo -e "${GREEN}Existing users:${NC}"
+  cat /etc/passwd | grep '/home' | cut -d: -f1
+  read -p "Enter username to remove: " USERNAME
+  if id "$USERNAME" &>/dev/null; then
+    userdel -r "$USERNAME"
+    echo -e "${GREEN}User ${USERNAME} removed.${NC}"
+  else
+    echo -e "${RED}User ${USERNAME} does not exist.${NC}"
+  fi
+}
+
 # Function to uninstall
 uninstall_dnstt() {
   echo -e "${GREEN}Uninstalling dnstt and cleaning up...${NC}"
@@ -134,27 +146,6 @@ uninstall_dnstt() {
   netfilter-persistent save
   apt purge -y dropbear
   echo -e "${GREEN}Uninstallation complete.${NC}"
-}
-
-# Function to backup
-backup_dnstt() {
-  echo -e "${GREEN}Backing up keys and config...${NC}"
-  mkdir -p "$BACKUP_DIR"
-  cp -r "$DNSTT_DIR/dnstt-server/server.key" "$DNSTT_DIR/dnstt-server/server.pub" "$CONFIG_DIR" "$BACKUP_DIR"
-  echo -e "${GREEN}Backup saved to $BACKUP_DIR.${NC}"
-}
-
-# Function to restore
-restore_dnstt() {
-  if [ -d "$BACKUP_DIR" ]; then
-    echo -e "${GREEN}Restoring from backup...${NC}"
-    cp -r "$BACKUP_DIR/server.key" "$BACKUP_DIR/server.pub" "$DNSTT_DIR/dnstt-server/"
-    cp -r "$BACKUP_DIR/dnstt.conf" "$CONFIG_DIR/"
-    systemctl restart dnstt-server
-    echo -e "${GREEN}Restore complete. Restarting service...${NC}"
-  else
-    echo -e "${RED}No backup found in $BACKUP_DIR.${NC}"
-  fi
 }
 
 # Function to check status
@@ -177,20 +168,18 @@ while true; do
   echo "1. Install SlowDNS (dnstt)"
   echo "2. Add SSH User"
   echo "3. Uninstall SlowDNS"
-  echo "4. Backup Config"
-  echo "5. Restore Config"
-  echo "6. Check Status"
-  echo "7. Exit"
-  read -p "Choose an option [1-7]: " OPTION
+  echo "4. Remove SSH User"
+  echo "5. Check Status"
+  echo "6. Exit"
+  read -p "Choose an option [1-6]: " OPTION
 
   case $OPTION in
     1) install_deps && install_dnstt ;;
     2) add_user ;;
     3) uninstall_dnstt ;;
-    4) backup_dnstt ;;
-    5) restore_dnstt ;;
-    6) check_status ;;
-    7) echo -e "${GREEN}Exiting...${NC}"; exit 0 ;;
+    4) remove_user ;;
+    5) check_status ;;
+    6) echo -e "${GREEN}Exiting...${NC}"; exit 0 ;;
     *) echo -e "${RED}Invalid option.${NC}" ;;
   esac
 done
