@@ -1,10 +1,8 @@
 #!/bin/bash
+# SlowDNS (dnstt) Installer Script for Ubuntu
+# Author: Humran13 (fixed version)
 
-# SlowDNS (dnstt) Installer Script for Ubuntu - Undetectable DNS Tunneling
-# GitHub: Humran13
-# Run as root: sudo ./slowdns-installer.sh
-
-# Colors for output
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -15,18 +13,13 @@ DNSTT_DIR="/opt/dnstt"
 CONFIG_DIR="/etc/dnstt"
 SERVICE_FILE="/etc/systemd/system/dnstt-server.service"
 
-# Check if root
+# Check root
 if [ "$EUID" -ne 0 ]; then
   echo -e "${RED}Please run as root (sudo).${NC}"
   exit 1
 fi
 
-# Function to check if a package is installed
-check_package() {
-  dpkg -l "$1" &> /dev/null && return 0 || return 1
-}
-
-# Function to install dependencies
+# Install dependencies
 install_deps() {
   echo -e "${GREEN}Installing dependencies...${NC}"
   apt update && apt upgrade -y
@@ -36,8 +29,10 @@ install_deps() {
   }
 }
 
-# Function to install dnstt
+# Install dnstt
 install_dnstt() {
+  mkdir -p "$CONFIG_DIR"
+
   if [ -d "$DNSTT_DIR" ]; then
     echo -e "${YELLOW}dnstt already installed at $DNSTT_DIR. Skipping clone.${NC}"
   else
@@ -48,35 +43,36 @@ install_dnstt() {
     }
   fi
 
-  # Build dnstt-server
-  cd "$DNSTT_DIR/dnstt-server"
-  go build || { echo -e "${RED}Build failed. Ensure Go is installed.${NC}"; exit 1; }
+  cd "$DNSTT_DIR"
+  go build ./dnstt-server ./dnstt-client || {
+    echo -e "${RED}Build failed. Ensure Go is installed.${NC}"
+    exit 1
+  }
 
-  # Generate keys
   echo -e "${GREEN}Generating encryption keys...${NC}"
-  ./dnstt-server -gen-key -privkey-file server.key -pubkey-file server.pub
-  PUBKEY=$(cat server.pub)
+  "$DNSTT_DIR/dnstt-server" -gen-key -privkey-file "$DNSTT_DIR/server.key" -pubkey-file "$DNSTT_DIR/server.pub"
+  PUBKEY=$(cat "$DNSTT_DIR/server.pub")
   echo -e "${GREEN}Public key: ${PUBKEY}${NC}"
 
-  # Prompt for tunnel domain
   read -p "Enter your tunnel subdomain (e.g., t.example.com): " TUNNEL_DOMAIN
   echo "TUNNEL_DOMAIN=${TUNNEL_DOMAIN}" > "$CONFIG_DIR/dnstt.conf"
 
-  # Set up Dropbear on port 2222
   echo -e "${GREEN}Configuring Dropbear SSH on port 2222...${NC}"
   sed -i 's/NO_START=1/NO_START=0/' /etc/default/dropbear
-  sed -i 's/DROPBEAR_PORT=22/DROPBEAR_PORT=2222/' /etc/default/dropbear
+  if grep -q "^DROPBEAR_PORT=" /etc/default/dropbear; then
+    sed -i 's/^DROPBEAR_PORT=.*/DROPBEAR_PORT=2222/' /etc/default/dropbear
+  else
+    echo "DROPBEAR_PORT=2222" >> /etc/default/dropbear
+  fi
   systemctl restart dropbear
 
-  # Set up iptables
-  echo -e "${GREEN}Setting up port forwarding (UDP 53 -> 5300)...${NC}"
+  echo -e "${GREEN}Setting up iptables...${NC}"
   iptables -I INPUT -p udp --dport 5300 -j ACCEPT
   iptables -t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
-  ip6tables -I INPUT -p udp --dport 5300 -j ACCEPT
-  ip6tables -t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
+  ip6tables -I INPUT -p udp --dport 5300 -j ACCEPT 2>/dev/null || true
+  ip6tables -t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300 2>/dev/null || true
   netfilter-persistent save
 
-  # Create systemd service
   echo -e "${GREEN}Creating systemd service...${NC}"
   cat <<EOF > "$SERVICE_FILE"
 [Unit]
@@ -84,7 +80,7 @@ Description=dnstt-server DNS Tunnel
 After=network.target
 
 [Service]
-ExecStart=$DNSTT_DIR/dnstt-server/dnstt-server -udp :5300 -privkey-file $DNSTT_DIR/dnstt-server/server.key ${TUNNEL_DOMAIN} 127.0.0.1:2222
+ExecStart=$DNSTT_DIR/dnstt-server -udp :5300 -privkey-file $DNSTT_DIR/server.key ${TUNNEL_DOMAIN} 127.0.0.1:2222
 Restart=always
 User=root
 
@@ -96,12 +92,11 @@ EOF
   systemctl enable dnstt-server
   systemctl start dnstt-server
 
-  # Verify
   if systemctl is-active --quiet dnstt-server; then
     echo -e "${GREEN}Installation complete! dnstt-server is running.${NC}"
     echo -e "${YELLOW}Save this public key for HTTP Injector:${NC} ${PUBKEY}"
     echo -e "${YELLOW}DNS Setup:${NC}"
-    echo "  - A/AAAA: tns.${TUNNEL_DOMAIN#*.} -> Your server's IPv4/IPv6"
+    echo "  - A/AAAA: tns.${TUNNEL_DOMAIN#*.} -> Your server's IP"
     echo "  - NS: ${TUNNEL_DOMAIN} -> tns.${TUNNEL_DOMAIN#*.}"
   else
     echo -e "${RED}Installation failed. Check logs with 'journalctl -u dnstt-server'.${NC}"
@@ -109,19 +104,24 @@ EOF
   fi
 }
 
-# Function to add a user
+# Add user
 add_user() {
   read -p "Enter new username: " USERNAME
   read -s -p "Enter password: " PASSWORD
   echo
-  echo "${USERNAME}:${PASSWORD}" | chpasswd
-  echo -e "${GREEN}User ${USERNAME} added for Dropbear SSH.${NC}"
+  if id "$USERNAME" &>/dev/null; then
+    echo -e "${RED}User already exists.${NC}"
+  else
+    useradd -m -s /bin/bash "$USERNAME"
+    echo "${USERNAME}:${PASSWORD}" | chpasswd
+    echo -e "${GREEN}User ${USERNAME} added for Dropbear SSH.${NC}"
+  fi
 }
 
-# Function to remove a user
+# Remove user
 remove_user() {
   echo -e "${GREEN}Existing users:${NC}"
-  cat /etc/passwd | grep '/home' | cut -d: -f1
+  awk -F: '$3>=1000{print $1}' /etc/passwd
   read -p "Enter username to remove: " USERNAME
   if id "$USERNAME" &>/dev/null; then
     userdel -r "$USERNAME"
@@ -131,7 +131,7 @@ remove_user() {
   fi
 }
 
-# Function to uninstall
+# Uninstall
 uninstall_dnstt() {
   echo -e "${GREEN}Uninstalling dnstt and cleaning up...${NC}"
   systemctl stop dnstt-server
@@ -141,14 +141,14 @@ uninstall_dnstt() {
   rm -rf "$DNSTT_DIR" "$CONFIG_DIR"
   iptables -D INPUT -p udp --dport 5300 -j ACCEPT
   iptables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
-  ip6tables -D INPUT -p udp --dport 5300 -j ACCEPT
-  ip6tables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300
+  ip6tables -D INPUT -p udp --dport 5300 -j ACCEPT 2>/dev/null || true
+  ip6tables -t nat -D PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300 2>/dev/null || true
   netfilter-persistent save
   apt purge -y dropbear
   echo -e "${GREEN}Uninstallation complete.${NC}"
 }
 
-# Function to check status
+# Status
 check_status() {
   echo -e "${GREEN}Checking dnstt status...${NC}"
   if systemctl is-active --quiet dnstt-server; then
@@ -157,12 +157,11 @@ check_status() {
     echo -e "${RED}dnstt-server is stopped.${NC}"
   fi
   echo -e "${GREEN}Active SSH users:${NC}"
-  netstat -tuln | grep :2222
-  ps aux | grep dropbear | grep -v grep
+  ss -tuln | grep :2222 || echo "No SSH connections on 2222"
+  pgrep -a dropbear || echo "Dropbear not running"
 }
 
-# Main menu
-mkdir -p "$CONFIG_DIR"
+# Menu
 while true; do
   echo -e "${YELLOW}=== SlowDNS Installer (Humran13) ===${NC}"
   echo "1. Install SlowDNS (dnstt)"
