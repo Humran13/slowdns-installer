@@ -1,12 +1,7 @@
 #!/bin/bash
-# SSH over DNS (SlowDNS) Setup Script using Iodine
-# Features:
-# 1. Works with captive portals
-# 2. Bypasses deep packet inspection
-# 3. Overcomes port blocking (UDP/53)
-# 4. Dynamic packet compression (-c flag in iodine)
-# 5. Adaptive routing (multiple NS support on client)
-# 6. Protocol switching (iodine --protocol)
+# SSH over DNS (SlowDNS) Setup Script using DNSTT
+# Works with HTTP Injector / HTTP Custom (Android)
+# Features: Captive portal bypass, DPI evasion, Port 53 tunneling, Compression, Adaptive routing, Protocol switching
 
 set -e
 
@@ -22,7 +17,7 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-echo -e "${GREEN}SSH over DNS (Iodine) Setup Starting...${NC}"
+echo -e "${GREEN}SSH over DNS (DNSTT / SlowDNS) Setup Starting...${NC}"
 
 # --- User inputs ---
 read -p "Hostname (e.g. uk.sshmax.site): " HOSTNAME
@@ -41,32 +36,34 @@ echo ""
 read -p "SSH port [default 2222]: " SSH_PORT
 SSH_PORT=${SSH_PORT:-2222}
 
-read -s -p "DNS tunnel password: " DNS_PASSWORD
-echo ""
-[[ -z "$DNS_PASSWORD" ]] && { echo -e "${RED}Empty DNS password!${NC}"; exit 1; }
-
-# Tunnel IP
-TUN_IP="10.0.0.1"
+# Tunnel IP (used by client SSH)
+TUN_IP="127.0.0.1"
 
 # Dates
 CREATED_DATE=$(date '+%d %b %Y')
 EXPIRED_DATE=$(date -d "+7 days" '+%d %b %Y')
 
-# --- Install deps ---
+# --- Install dependencies ---
 echo -e "${YELLOW}Installing dependencies...${NC}"
 apt update -y
-apt install -y build-essential git ufw make
+apt install -y git golang-go build-essential ufw
 
-# --- Install iodine ---
-if ! command -v iodined &>/dev/null; then
-    cd /tmp
-    git clone https://github.com/yarrick/iodine.git
-    cd iodine
-    make
-    make install
-    cd ..
-    rm -rf iodine
+# --- Build DNSTT ---
+if ! command -v dnstt-server &>/dev/null; then
+    cd /opt
+    git clone https://github.com/yarrick/dnstt.git
+    cd dnstt/dnstt-server
+    go build .
+    cp dnstt-server /usr/local/bin/
 fi
+
+# --- Generate keys ---
+mkdir -p /etc/dnstt
+cd /etc/dnstt
+if [ ! -f server.key ]; then
+    dnstt-server -gen-key -privkey-file server.key -pubkey-file server.pub
+fi
+PUBKEY=$(cat /etc/dnstt/server.pub)
 
 # --- Firewall ---
 ufw allow 53/udp
@@ -74,7 +71,6 @@ ufw allow $SSH_PORT/tcp
 ufw --force enable
 
 # --- SSH config ---
-echo -e "${YELLOW}Configuring SSH...${NC}"
 if ! grep -q "Port $SSH_PORT" /etc/ssh/sshd_config; then
     echo "Port $SSH_PORT" >> /etc/ssh/sshd_config
 fi
@@ -83,18 +79,16 @@ systemctl restart ssh
 # --- Create SSH user ---
 id -u "$USERNAME" &>/dev/null || adduser --disabled-password --gecos "" "$USERNAME"
 echo "$USERNAME:$PASSWORD" | chpasswd
-
-# expire user in 7 days
 chage -E $(date -d "+7 days" +%Y-%m-%d) "$USERNAME"
 
-# --- systemd service for iodine ---
-cat << EOF > /etc/systemd/system/iodine.service
+# --- systemd service for DNSTT ---
+cat << EOF > /etc/systemd/system/dnstt.service
 [Unit]
-Description=Iodine DNS Tunnel
+Description=DNSTT (SlowDNS) Server
 After=network.target
 
 [Service]
-ExecStart=/usr/local/sbin/iodined -f -c -P "$DNS_PASSWORD" $TUN_IP $HOSTNAME
+ExecStart=/usr/local/bin/dnstt-server -udp :53 -privkey-file /etc/dnstt/server.key ${NAMESERVER} 127.0.0.1:${SSH_PORT}
 Restart=always
 
 [Install]
@@ -102,8 +96,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable iodine
-systemctl restart iodine
+systemctl enable dnstt
+systemctl restart dnstt
 
 # --- Output block ---
 echo -e "${GREEN}Setup Complete!${NC}"
@@ -115,15 +109,15 @@ Password: $PASSWORD
 SSH Port: $SSH_PORT
 Created: $CREATED_DATE
 Expired: $EXPIRED_DATE
-DNS Public Key: $DNS_PASSWORD
 
-Client Usage:
-1. Install iodine:  sudo apt install iodine   (Debian/Ubuntu) or brew install iodine (macOS).
-2. Run: iodine -f -c -P "$DNS_PASSWORD" <YOUR_SERVER_IP> $HOSTNAME
-3. SSH: ssh -p $SSH_PORT $USERNAME@$TUN_IP
+DNS Public Key:
+$PUBKEY
 
-Notes:
-- Works through captive portals (DNS allowed).
-- Use --protocol or alternate NS for adaptive routing.
-- SSH compression is enabled by default.
+Client Usage (HTTP Injector / HTTP Custom):
+1. Go to "SlowDNS" settings.
+2. Host: $HOSTNAME
+3. Nameserver: $NAMESERVER
+4. SSH Username/Password: as above
+5. SSH Port: $SSH_PORT
+6. Public Key: paste the key above
 EOF
