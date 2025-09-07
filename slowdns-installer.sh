@@ -1,125 +1,304 @@
-#!/bin/bash
-
-# SSH Over DNS (Slow DNS) Server Setup Script for Ubuntu
-# This script sets up an Iodine DNS tunnel server on Ubuntu, creates a temporary SSH user,
-# and generates client configuration details.
-# Features:
-# 1. Works with captive portals: DNS queries typically bypass HTTP/HTTPS interception.
-# 2. Bypasses deep packet inspection: Traffic is encoded within standard DNS packets.
-# 3. Overcomes port blocking: Utilizes DNS port 53 (UDP), which is rarely blocked.
-# 4. Dynamic packet compression: Enabled via Iodine's built-in compression (-c flag).
-# 5. Adaptive connection routing: Script supports multiple nameservers for failover (configurable).
-# 6. Intelligent protocol switching: Iodine supports multiple encoding protocols; client can switch via --protocol flag.
+#!/usr/bin/env bash
+# install-slowdns.sh
+# Ubuntu installer for a DNSTT (SlowDNS) + optional Hysteria fallback,
+# with prompts for domain/nameserver/credentials and a small "switch" helper.
 #
-# Prerequisites:
-# - Run as root (sudo ./setup.sh)
-# - You must have a domain (e.g., sshmax.site) with NS records set up:
-#   - For subdomain uk.sshmax.site, set NS to uk-ns.sshmax.site
-#   - Point uk-ns.sshmax.site A record to your server's public IP
-# - Firewall: Allow UDP port 53 (ufw allow 53/udp)
-# - SSH: Ensure SSH is installed and running.
+# Notes:
+# - Does NOT hardcode your VPS IP (you will be prompted).
+# - Designed for Ubuntu 20.04 / 22.04 / 24.04.
+# - Requires sudo / root.
 #
-# Usage: sudo bash setup_ssh_over_dns.sh
-# After setup, run the Iodine server manually or via systemd (see below).
-# Client example: iodine -f -P <DNS_PASSWORD> <SERVER_IP> uk.sshmax.site
-# Then SSH: ssh -p 2222 sshmax-admin1@10.0.0.1
+# Adapted for GitHub distribution. Keep license & attribution where required.
 
-set -e  # Exit on error
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+# --- helper functions ---
+info(){ echo -e "\n[INFO] $*"; }
+warn(){ echo -e "\n[WARN] $*"; }
+err(){ echo -e "\n[ERROR] $*"; exit 1; }
 
-echo -e "${GREEN}Starting SSH Over DNS setup...${NC}"
-
-# Step 1: Update system and install dependencies
-echo -e "${YELLOW}Updating system and installing dependencies...${NC}"
-apt update -y
-apt upgrade -y
-apt install -y build-essential libssl-dev zlib1g-dev git ufw adduser
-
-# Step 2: Install Iodine from source (if not available in repos)
-echo -e "${YELLOW}Installing Iodine...${NC}"
-if ! command -v iodined &> /dev/null; then
-    cd /tmp
-    git clone https://github.com/yarrick/iodine.git
-    cd iodine
-    make
-    make install
-    cd ..
-    rm -rf iodine
+if [ "$(id -u)" -ne 0 ]; then
+  err "Please run as root (sudo)."
 fi
 
-# Step 3: Configure firewall (allow DNS port 53 UDP)
-echo -e "${YELLOW}Configuring firewall...${NC}"
-ufw allow 53/udp
-ufw --force enable
-ufw status
+# --- Ask user for inputs (no IP requested) ---
+read -p "Enter hostname (example: uk.sshmax.site): " HOSTNAME
+read -p "Enter nameserver (the domain you will use as DNS name server): " NAMESERVER
+read -p "Enter SSH username to create: " SSH_USER
+read -s -p "Enter SSH password for user: " SSH_PASS
+echo
+read -p "Enter SSH port to run backend (example 2222): " SSH_PORT
+read -p "Credential valid days (default 7): " EXPIRE_DAYS
+EXPIRE_DAYS=${EXPIRE_DAYS:-7}
 
-# Step 4: Configure SSH to listen on port 2222 for the tunnel
-echo -e "${YELLOW}Configuring SSH...${NC}"
-sed -i 's/#Port 22/Port 2222/' /etc/ssh/sshd_config
-systemctl restart ssh
+# Optional advanced features
+read -p "Install Hysteria (obfuscated UDP fallback) [y/N]? " INSTALL_HYSTERIA
+INSTALL_HYSTERIA=${INSTALL_HYSTERIA:-N}
 
-# Step 5: Create temporary SSH user
-USERNAME="sshmax-admin1"
-PASSWORD="admin123"
-echo -e "${YELLOW}Creating SSH user: $USERNAME${NC}"
-adduser --disabled-password --gecos "" $USERNAME
-echo "$USERNAME:$PASSWORD" | chpasswd
+# Optional: DoH/DoT resolver to forward client DNS to
+read -p "Upstream recursive resolver (IP or DoH URL) [default: 1.1.1.1]: " UPSTREAM
+UPSTREAM=${UPSTREAM:-1.1.1.1}
 
-# Set expiration (7 days from now)
-EXPIRED_DATE=$(date -d "+7 days" '+%d %b %Y')
-CREATED_DATE=$(date '+%d %b %Y')
+CREATED_DATE=$(date "+%e %b %Y")
+EXPIRES_DATE=$(date -d "+${EXPIRE_DAYS} days" "+%e %b %Y")
 
-# Step 6: Iodine configuration details
-HOSTNAME="uk.sshmax.site"
-NAMESERVER="uk-ns.sshmax.site"
-TUN_IP="10.0.0.1"  # IP assigned to client
-SSH_PORT="2222"
-DNS_PASSWORD="dnskey123"  # This will be the "DNS Public Key" - change for security
-# For adaptive routing, add more NS records and use multiple in client config
+# --- System prep ---
+info "Updating packages..."
+apt-get update -y
+apt-get install -y git build-essential golang-go wget curl ca-certificates \
+    iptables-persistent socat jq
 
-# Output the client configuration
-echo -e "${GREEN}Setup complete! Client Configuration:${NC}"
-echo "Hostname: $HOSTNAME"
-echo "Nameserver: $NAMESERVER"
-echo "Username: $USERNAME"
-echo "Password: $PASSWORD"
-echo "SSH Port: $SSH_PORT"
-echo "Created: $CREATED_DATE"
-echo "Expired: $EXPIRED_DATE"
-echo "DNS Public Key: $DNS_PASSWORD"
+# --- Create SSH user ---
+info "Creating SSH user ${SSH_USER}..."
+if id "${SSH_USER}" >/dev/null 2>&1; then
+  warn "User ${SSH_USER} already exists; skipping creation."
+else
+  useradd -m -s /bin/bash "${SSH_USER}"
+  echo "${SSH_USER}:${SSH_PASS}" | chpasswd
+fi
 
-# Instructions for running the server
-echo -e "${YELLOW}To start the Iodine server (run as root):${NC}"
-echo "iodined -f -c -P $DNS_PASSWORD $TUN_IP $HOSTNAME"
-echo ""
-echo -e "${YELLOW}For systemd service (create /etc/systemd/system/iodine.service):${NC}"
-cat << EOF > /etc/systemd/system/iodine.service
+# Ensure SSH allows TCP forwarding and compression (helps with proxied tunnels)
+info "Configuring OpenSSH..."
+sed -i 's/^#AllowTcpForwarding.*/AllowTcpForwarding yes/' /etc/ssh/sshd_config || true
+sed -i 's/^#Compression.*/Compression yes/' /etc/ssh/sshd_config || true
+systemctl restart sshd
+
+# --- Install DNSTT (dnstt-server) ---
+info "Installing dnstt (SlowDNS server)..."
+TMPDIR=$(mktemp -d)
+cd "$TMPDIR"
+git clone https://github.com/tladesignz/dnstt.git dnstt || git clone https://github.com/Mygod/dnstt.git dnstt || true
+cd dnstt || err "dnstt repo not found; please check git clone above."
+
+# Build server (repo variations: some have ./dnstt-server, some have dnstt-server dir)
+if [ -f "./dnstt-server/main.go" ] || [ -d "./dnstt-server" ]; then
+  cd dnstt-server || true
+fi
+
+# try to build
+info "Building dnstt-server (go build)..."
+export GOPATH=/root/go
+mkdir -p "$GOPATH"
+if command -v go >/dev/null 2>&1; then
+  go build -o /usr/local/bin/dnstt-server ./... || true
+else
+  warn "go not found; trying apt-installed golang-go..."
+  go build -o /usr/local/bin/dnstt-server ./... || err "go build failed. Install golang and retry."
+fi
+
+if [ ! -x /usr/local/bin/dnstt-server ]; then
+  # fallback: maybe binary is at ./dnstt-server
+  if [ -f "./dnstt-server" ]; then
+    cp ./dnstt-server /usr/local/bin/dnstt-server
+    chmod +x /usr/local/bin/dnstt-server
+  else
+    err "Failed to place dnstt-server binary."
+  fi
+fi
+
+# --- Generate DNSTT keypair ---
+DNSTT_DIR=/etc/dnstt
+mkdir -p "$DNSTT_DIR"
+info "Generating DNSTT keypair..."
+/usr/local/bin/dnstt-server -gen-key -privkey-file "$DNSTT_DIR/server.key" -pubkey-file "$DNSTT_DIR/server.pub" >/dev/null 2>&1 || true
+if [ ! -f "$DNSTT_DIR/server.pub" ]; then
+  warn "dnstt key generation didn't produce server.pub in expected place; trying alternate path..."
+  /usr/local/bin/dnstt-server -gen-key -privkey-file server.key -pubkey-file server.pub || true
+  mv server.key server.pub "$DNSTT_DIR/" || true
+fi
+
+PUBKEY="$(cat ${DNSTT_DIR}/server.pub || echo 'UNKNOWN_PUBKEY')"
+
+# --- Create systemd service for dnstt ---
+info "Creating systemd service for dnstt..."
+cat > /etc/systemd/system/dnstt.service <<EOF
 [Unit]
-Description=Iodine DNS Tunnel Server
+Description=dnstt DNS tunnel server
 After=network.target
 
 [Service]
 Type=simple
+ExecStart=/usr/local/bin/dnstt-server -udp :53 -privkey-file ${DNSTT_DIR}/server.key ${NAMESERVER} ${UPSTREAM} 127.0.0.1:${SSH_PORT}
+Restart=always
 User=root
-ExecStart=/usr/local/sbin/iodined -c -P $DNS_PASSWORD $TUN_IP $HOSTNAME
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable dnstt.service
+systemctl restart dnstt.service || warn "dnstt service failed to start - check journalctl -u dnstt"
+
+# --- Install udpgw helper for UDP forwarding (helps UDP apps) ---
+info "Installing UDP GW helper (badvpn-udpgw) for local UDP forwarding..."
+if [ ! -f /usr/bin/badvpn-udpgw ]; then
+  OSARCH=$(uname -m)
+  if [ "$OSARCH" = "x86_64" ]; then
+    wget -qO /usr/bin/badvpn-udpgw "https://raw.githubusercontent.com/daybreakersx/premscript/master/badvpn-udpgw64" || true
+  else
+    wget -qO /usr/bin/badvpn-udpgw "https://raw.githubusercontent.com/daybreakersx/premscript/master/badvpn-udpgw" || true
+  fi
+  chmod +x /usr/bin/badvpn-udpgw || true
+fi
+
+cat > /etc/systemd/system/udpgw.service <<EOF
+[Unit]
+Description=UDPGW Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/badvpn-udpgw --listen-addr 127.0.0.1:7300
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 EOF
-echo "Then: systemctl daemon-reload && systemctl enable iodine && systemctl start iodine"
-echo ""
-echo -e "${YELLOW}Client Usage:${NC}"
-echo "1. On client (install iodine similarly): iodine -f -c -P $DNS_PASSWORD <YOUR_SERVER_IP> $HOSTNAME"
-echo "2. This creates tun0 with IP $TUN_IP/30"
-echo "3. SSH: ssh -p $SSH_PORT $USERNAME@$TUN_IP"
-echo "4. For adaptive routing: Use multiple nameservers in /etc/resolv.conf or client args."
-echo "5. Protocol switching: Client use --protocol 200 (or others) if blocked."
-echo ""
-echo -e "${RED}Security Note: Change passwords and domain for production. User expires on $EXPIRED_DATE.${NC}"
-echo -e "${GREEN}Script ready for GitHub! Add a README with prerequisites and features.${NC}"
+systemctl daemon-reload
+systemctl enable udpgw.service
+systemctl restart udpgw.service
+
+# --- Optional: install Hysteria (for obfuscated UDP fallback) ---
+if [[ "${INSTALL_HYSTERIA,,}" =~ ^y ]]; then
+  info "Installing Hysteria server as an alternate obfuscated UDP tunnel..."
+  # Download prebuilt binary (use official release in production)
+  HYST_BIN=/usr/local/bin/hysteria
+  if [ ! -f "$HYST_BIN" ]; then
+    wget -qO /usr/local/bin/hysteria https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64 || true
+    chmod +x /usr/local/bin/hysteria || true
+  fi
+
+  HYST_PASS=$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | cut -c1-12)
+  mkdir -p /etc/hysteria
+  cat > /etc/hysteria/server.json <<EOF
+{
+  "listen": ":8443",
+  "protocol": "udp",
+  "auth": {
+    "mode":"password",
+    "password":"${HYST_PASS}"
+  },
+  "obfs": {
+    "type": "salamander",
+    "salamander": { "password": "2031" }
+  },
+  "up_mbps": 100,
+  "down_mbps": 100,
+  "sockbuf": 16777216
+}
+EOF
+
+  cat > /etc/systemd/system/hysteria.service <<EOF
+[Unit]
+Description=Hysteria server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hysteria -c /etc/hysteria/server.json
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable hysteria.service
+  systemctl restart hysteria.service || warn "hysteria failed to start; check logs."
+fi
+
+# --- Create a small "switch" and "healthcheck" helper (adaptive routing helper) ---
+info "Creating tunnel control helpers (/usr/local/bin/switch-tunnel and /usr/local/bin/tunnel-healthcheck)..."
+
+cat > /usr/local/bin/switch-tunnel <<'EOF'
+#!/usr/bin/env bash
+# Usage: switch-tunnel dnstt|hysteria
+if [ "$(id -u)" -ne 0 ]; then echo "run as root"; exit 1; fi
+case "${1:-}" in
+  dnstt)
+    systemctl stop hysteria.service 2>/dev/null || true
+    systemctl start dnstt.service
+    echo "Active: dnstt"
+    ;;
+  hysteria)
+    systemctl stop dnstt.service 2>/dev/null || true
+    systemctl start hysteria.service
+    echo "Active: hysteria"
+    ;;
+  *)
+    echo "Usage: switch-tunnel dnstt|hysteria"
+    exit 2
+    ;;
+esac
+EOF
+chmod +x /usr/local/bin/switch-tunnel
+
+cat > /usr/local/bin/tunnel-healthcheck <<'EOF'
+#!/usr/bin/env bash
+# Basic health check: tries to connect to local tunnel endpoints and picks a running one
+DNSTT_OK=false
+HYST_OK=false
+
+# check UDP port 53 (dnstt) by seeing if systemd says active
+if systemctl is-active --quiet dnstt.service; then DNSTT_OK=true; fi
+if systemctl is-active --quiet hysteria.service; then HYST_OK=true; fi
+
+echo "dnstt: $DNSTT_OK  hysteria: $HYST_OK"
+
+if [ "$DNSTT_OK" = "true" ]; then
+  /usr/local/bin/switch-tunnel dnstt
+elif [ "$HYST_OK" = "true" ]; then
+  /usr/local/bin/switch-tunnel hysteria
+else
+  echo "Neither tunnel appears active. Start one with switch-tunnel."
+  exit 1
+fi
+EOF
+chmod +x /usr/local/bin/tunnel-healthcheck
+
+# --- Simple firewall rules to allow tunnel ports and protect SSH ---
+info "Adding basic iptables rules for tunnel ports..."
+iptables -I INPUT -p udp --dport 53 -j ACCEPT || true
+iptables -I INPUT -p udp --dport 8443 -j ACCEPT || true
+iptables -I INPUT -p tcp --dport ${SSH_PORT} -j ACCEPT || true
+netfilter-persistent save || true
+
+# --- print credentials / final block ---
+cat <<EOF
+
+==========================
+Hostname: ${HOSTNAME}
+
+Nameserver: ${NAMESERVER}
+
+Username: ${SSH_USER}
+
+Password: (hidden)
+
+SSH Port: ${SSH_PORT}
+
+Created: ${CREATED_DATE}
+
+Expired: ${EXPIRES_DATE}
+
+DNS Public Key:
+${PUBKEY}
+
+Notes:
+- dnstt server listens on UDP/53 by default; point your SlowDNS client to ${NAMESERVER} and use the above public key.
+- If you installed Hysteria, its password is in /etc/hysteria/server.json (and obfs salamander password set to 2031).
+- Use 'switch-tunnel dnstt' or 'switch-tunnel hysteria' to change active backend.
+- Use 'tunnel-healthcheck' to auto-select available tunnel.
+- For captive-portal situations: you may need to authenticate to portal before the tunnel works. DNSTT can use DoH/DoT (configured by client) to help when UDP is blocked. Hysteria supports obfuscation ("salamander") for DPI resistance.
+- Check logs: journalctl -u dnstt -f or journalctl -u hysteria -f
+==========================
+
+EOF
+
+# cleanup
+cd /
+rm -rf "$TMPDIR" || true
+
+info "Installation finished. Please add DNS A/NS records for ${NAMESERVER} pointing to your server's public IP."
