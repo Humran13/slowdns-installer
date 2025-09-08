@@ -44,9 +44,9 @@ check_port() {
 
 # --- Prompt for user inputs ---
 info "Enter configuration details (press Enter for defaults where applicable)."
-read -p "Hostname (e.g., uk.sshmax.site): " HOSTNAME
+read -p "Hostname (e.g., yourdomain.com): " HOSTNAME
 [[ -z "$HOSTNAME" || ! "$HOSTNAME" =~ ^[a-zA-Z0-9.-]+$ ]] && err "Invalid or empty hostname."
-read -p "Nameserver (e.g., uk-ns.sshmax.site): " NAMESERVER
+read -p "Nameserver (e.g., t.yourdomain.com): " NAMESERVER
 [[ -z "$NAMESERVER" || ! "$NAMESERVER" =~ ^[a-zA-Z0-9.-]+$ ]] && err "Invalid or empty nameserver."
 read -p "SSH username: " SSH_USER
 [[ -z "$SSH_USER" || ! "$SSH_USER" =~ ^[a-zA-Z0-9_-]+$ ]] && err "Invalid or empty username."
