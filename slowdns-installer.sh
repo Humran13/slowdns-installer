@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 # install-slowdns.sh
 # Interactive Ubuntu installer for DNSTT (SlowDNS) with optional Hysteria fallback.
+# Based on khaledagn/SlowDNS, modified for Humran13/SlowDNS-Setup.
 # Features:
 # 1. Works with captive portals: Supports DoH/DoT via client configuration.
 # 2. Bypasses deep packet inspection: DNSTT uses DNS encoding; Hysteria uses QUIC obfuscation.
 # 3. Overcomes port blocking: Uses UDP 53 (DNS) and configurable Hysteria port.
 # 4. Dynamic packet compression: Enabled via DNSTT -compress flag.
 # 5. Adaptive connection routing: Health check script switches between DNSTT/Hysteria.
-# 6. Intelligent protocol switching: Client-side DoH/DoT and server-side DNSTT/Hysteria toggle.
+# 6. Intelligent protocol switching: Server-side DNSTT/Hysteria toggle; client-side DoH/DoT.
 #
 # Requirements:
 # - Ubuntu 20.04/22.04/24.04, root access (sudo).
-# - DNS setup: NS record for <hostname> pointing to <nameserver>, A record for <nameserver> to server IP.
+# - DNS setup: NS record for yourdomain.com to t.yourdomain.com, A record for t.yourdomain.com to server IP.
 # Usage: sudo bash install-slowdns.sh
-# After setup, use 'switch-tunnel' and 'tunnel-healthcheck' for protocol management.
+# Tested on Ubuntu 24.04 with DNSTT and Hysteria v2.5.0.
 
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -34,23 +35,35 @@ if [ "$(id -u)" -ne 0 ]; then
   err "Please run as root (sudo)."
 fi
 
+# Validate port availability
+check_port() {
+  local port=$1
+  if ss -tuln | grep -q ":$port"; then
+    err "Port $port is already in use. Choose another."
+  fi
+}
+
 # --- Prompt for user inputs ---
 info "Enter configuration details (press Enter for defaults where applicable)."
-read -p "Hostname (e.g., uk.sshmax.site): " HOSTNAME
-[ -z "$HOSTNAME" ] && err "Hostname cannot be empty."
-read -p "Nameserver (e.g., uk-ns.sshmax.site, A record to server IP): " NAMESERVER
-[ -z "$NAMESERVER" ] && err "Nameserver cannot be empty."
+read -p "Hostname (e.g., yourdomain.com): " HOSTNAME
+HOSTNAME=${HOSTNAME:-yourdomain.com}
+[[ ! "$HOSTNAME" =~ ^[a-zA-Z0-9.-]+$ ]] && err "Invalid hostname."
+read -p "Nameserver (e.g., t.yourdomain.com): " NAMESERVER
+NAMESERVER=${NAMESERVER:-t.yourdomain.com}
+[[ ! "$NAMESERVER" =~ ^[a-zA-Z0-9.-]+$ ]] && err "Invalid nameserver."
 read -p "SSH username: " SSH_USER
-[ -z "$SSH_USER" ] && err "Username cannot be empty."
+[[ -z "$SSH_USER" || ! "$SSH_USER" =~ ^[a-zA-Z0-9_-]+$ ]] && err "Invalid or empty username."
 read -s -p "SSH password: " SSH_PASS
 echo
 [ -z "$SSH_PASS" ] && err "Password cannot be empty."
 read -p "SSH port (default: 2222): " SSH_PORT
 SSH_PORT=${SSH_PORT:-2222}
-read -p "Credential valid days (default: 7): " EXPIRE_DAYS
-EXPIRE_DAYS=${EXPIRE_DAYS:-7}
-read -p "Upstream resolver (IP or DoH URL, default: 1.1.1.1): " UPSTREAM
-UPSTREAM=${UPSTREAM:-1.1.1.1}
+check_port "$SSH_PORT"
+read -p "Credential valid days (default: 30): " EXPIRE_DAYS
+EXPIRE_DAYS=${EXPIRE_DAYS:-30}
+[[ ! "$EXPIRE_DAYS" =~ ^[0-9]+$ ]] && err "Expiration days must be a number."
+read -p "Upstream resolver (IP or DoH URL, default: https://1.1.1.1/dns-query): " UPSTREAM
+UPSTREAM=${UPSTREAM:-https://1.1.1.1/dns-query}
 read -p "Install Hysteria (UDP fallback) [y/N]? " INSTALL_HYSTERIA
 INSTALL_HYSTERIA=${INSTALL_HYSTERIA:-N}
 read -p "Use UFW instead of iptables for firewall? [y/N]: " USE_UFW
@@ -58,20 +71,29 @@ USE_UFW=${USE_UFW:-N}
 if [[ "${INSTALL_HYSTERIA,,}" =~ ^y ]]; then
   read -p "Hysteria port (default: 8443): " HYSTERIA_PORT
   HYSTERIA_PORT=${HYSTERIA_PORT:-8443}
+  check_port "$HYSTERIA_PORT"
   read -s -p "Hysteria password: " HYSTERIA_PASS
   echo
   [ -z "$HYSTERIA_PASS" ] && err "Hysteria password cannot be empty."
 fi
 
 # Calculate dates
-CREATED_DATE=$(date "+%e %b %Y")
-EXPIRES_DATE=$(date -d "+${EXPIRE_DAYS} days" "+%e %b %Y")
+CREATED_DATE=$(date "+%e %b %Y" | tr -s ' ')
+EXPIRES_DATE=$(date -d "+${EXPIRE_DAYS} days" "+%e %b %Y" | tr -s ' ')
 
 # --- Install dependencies ---
 info "Installing dependencies..."
 apt-get update -y || err "Failed to update package lists."
-apt-get install -y git build-essential golang-go wget curl ca-certificates \
-  netfilter-persistent iptables-persistent ufw || err "Failed to install dependencies."
+# Install only the chosen firewall tool
+if [[ "${USE_UFW,,}" =~ ^y ]]; then
+  apt-get install -y git build-essential golang-go wget curl ca-certificates ufw net-tools || err "Failed to install dependencies."
+else
+  apt-get install -y git build-essential golang-go wget curl ca-certificates netfilter-persistent iptables-persistent net-tools || err "Failed to install dependencies."
+fi
+# Verify Go version
+if ! command -v go >/dev/null 2>&1 || ! go version | grep -q "go1.[16-9]"; then
+  err "Go 1.16 or higher required. Install via 'sudo apt install golang-go' or manually."
+fi
 
 # --- Create SSH user with expiration ---
 info "Creating SSH user $SSH_USER..."
@@ -100,6 +122,7 @@ if [ -d "dnstt" ]; then rm -rf dnstt; fi
 git clone https://github.com/Mygod/dnstt.git || err "Failed to clone DNSTT repository."
 cd dnstt/dnstt-server
 go build -o /usr/local/bin/dnstt-server . || err "Failed to build DNSTT server."
+[ -x /usr/local/bin/dnstt-server ] || err "DNSTT binary not executable."
 cd /tmp
 rm -rf dnstt
 
@@ -127,7 +150,10 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
 systemctl enable dnstt.service
-systemctl restart dnstt.service || warn "DNSTT service failed to start; check journalctl -u dnstt."
+if ! systemctl restart dnstt.service; then
+  warn "DNSTT service failed to start; check journalctl -u dnstt."
+  journalctl -u dnstt --no-pager | tail -n 20
+fi
 
 # --- Install badvpn-udpgw for UDP forwarding ---
 info "Installing badvpn-udpgw for UDP forwarding..."
@@ -136,11 +162,12 @@ if [ ! -f /usr/bin/badvpn-udpgw ]; then
   if [ "$OSARCH" = "x86_64" ]; then
     wget -qO /usr/bin/badvpn-udpgw "https://github.com/ambrop72/badvpn/releases/download/1.999.130/badvpn-udpgw" || err "Failed to download badvpn-udpgw."
   else
-    err "badvpn-udpgw only supported on x86_64."
+    warn "badvpn-udpgw only supported on x86_64; skipping UDP forwarding."
   fi
-  chmod +x /usr/bin/badvpn-udpgw
+  [ -f /usr/bin/badvpn-udpgw ] && chmod +x /usr/bin/badvpn-udpgw
 fi
-cat > /etc/systemd/system/udpgw.service <<EOF
+if [ -f /usr/bin/badvpn-udpgw ]; then
+  cat > /etc/systemd/system/udpgw.service <<EOF
 [Unit]
 Description=UDPGW Service
 After=network.target
@@ -153,20 +180,26 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
-systemctl enable udpgw.service
-systemctl restart udpgw.service || warn "UDPGW service failed to start."
+  systemctl daemon-reload
+  systemctl enable udpgw.service
+  systemctl restart udpgw.service || warn "UDPGW service failed to start."
+fi
 
 # --- Install Hysteria (optional) ---
 if [[ "${INSTALL_HYSTERIA,,}" =~ ^y ]]; then
   info "Installing Hysteria server..."
   HYST_BIN=/usr/local/bin/hysteria
   if [ ! -f "$HYST_BIN" ]; then
-    wget -qO "$HYST_BIN" https://github.com/apernet/hysteria/releases/download/v2.5.0/hysteria-linux-amd64 || err "Failed to download Hysteria."
-    chmod +x "$HYST_BIN"
+    if [ "$(uname -m)" = "x86_64" ]; then
+      wget -qO "$HYST_BIN" https://github.com/apernet/hysteria/releases/download/v2.5.0/hysteria-linux-amd64 || err "Failed to download Hysteria."
+    else
+      warn "Hysteria only supported on x86_64; skipping."
+    fi
+    [ -f "$HYST_BIN" ] && chmod +x "$HYST_BIN"
   fi
-  mkdir -p /etc/hysteria
-  cat > /etc/hysteria/server.json <<EOF
+  if [ -f "$HYST_BIN" ]; then
+    mkdir -p /etc/hysteria
+    cat > /etc/hysteria/server.json <<EOF
 {
   "listen": ":$HYSTERIA_PORT",
   "protocol": "udp",
@@ -183,7 +216,7 @@ if [[ "${INSTALL_HYSTERIA,,}" =~ ^y ]]; then
   "sockbuf": 16777216
 }
 EOF
-  cat > /etc/systemd/system/hysteria.service <<EOF
+    cat > /etc/systemd/system/hysteria.service <<EOF
 [Unit]
 Description=Hysteria Server
 After=network.target
@@ -196,9 +229,13 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable hysteria.service
-  systemctl restart hysteria.service || warn "Hysteria service failed to start; check journalctl -u hysteria."
+    systemctl daemon-reload
+    systemctl enable hysteria.service
+    if ! systemctl restart hysteria.service; then
+      warn "Hysteria service failed to start; check journalctl -u hysteria."
+      journalctl -u hysteria --no-pager | tail -n 20
+    fi
+  fi
 fi
 
 # --- Create tunnel control scripts ---
@@ -245,14 +282,14 @@ chmod +x /usr/local/bin/tunnel-healthcheck
 # --- Configure firewall ---
 info "Configuring firewall..."
 if [[ "${USE_UFW,,}" =~ ^y ]]; then
-  ufw allow "$SSH_PORT"/tcp
-  ufw allow 53/udp
-  [[ "${INSTALL_HYSTERIA,,}" =~ ^y ]] && ufw allow "$HYSTERIA_PORT"/udp
-  ufw --force enable
+  ufw allow "$SSH_PORT"/tcp || warn "Failed to add UFW rule for SSH."
+  ufw allow 53/udp || warn "Failed to add UFW rule for DNSTT."
+  [[ "${INSTALL_HYSTERIA,,}" =~ ^y && -f /usr/local/bin/hysteria ]] && ufw allow "$HYSTERIA_PORT"/udp || true
+  ufw --force enable || warn "Failed to enable UFW."
 else
-  iptables -I INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT
-  iptables -I INPUT -p udp --dport 53 -j ACCEPT
-  [[ "${INSTALL_HYSTERIA,,}" =~ ^y ]] && iptables -I INPUT -p udp --dport "$HYSTERIA_PORT" -j ACCEPT
+  iptables -I INPUT -p tcp --dport "$SSH_PORT" -j ACCEPT || warn "Failed to add iptables rule for SSH."
+  iptables -I INPUT -p udp --dport 53 -j ACCEPT || warn "Failed to add iptables rule for DNSTT."
+  [[ "${INSTALL_HYSTERIA,,}" =~ ^y && -f /usr/local/bin/hysteria ]] && iptables -I INPUT -p udp --dport "$HYSTERIA_PORT" -j ACCEPT || true
   netfilter-persistent save || warn "Failed to save iptables rules."
 fi
 
@@ -268,7 +305,7 @@ SSH Port: $SSH_PORT
 Created: $CREATED_DATE
 Expired: $EXPIRES_DATE
 DNS Public Key: $PUBKEY
-$(if [[ "${INSTALL_HYSTERIA,,}" =~ ^y ]]; then
+$(if [[ "${INSTALL_HYSTERIA,,}" =~ ^y && -f /usr/local/bin/hysteria ]]; then
   echo "Hysteria Port: $HYSTERIA_PORT
 Hysteria Password: (hidden)"
 fi)
@@ -277,19 +314,19 @@ Notes:
 - DNSTT listens on UDP/53. Point your SlowDNS client to $NAMESERVER with the above public key.
 - Client command: dnstt-client -doh $UPSTREAM -pubkey $PUBKEY $NAMESERVER 127.0.0.1:$SSH_PORT
 - SSH: ssh -p $SSH_PORT $SSH_USER@127.0.0.1
-- For captive portals: Use DoH/DoT (e.g., https://1.1.1.1/dns-query) in client settings.
-- $(if [[ "${INSTALL_HYSTERIA,,}" =~ ^y ]]; then
+- For captive portals: Use DoH (e.g., $UPSTREAM) in client settings.
+- $(if [[ "${INSTALL_HYSTERIA,,}" =~ ^y && -f /usr/local/bin/hysteria ]]; then
   echo "Hysteria client: hysteria client -c /path/to/client.json (config in /etc/hysteria/server.json)."
 fi)
 - Switch tunnels: sudo switch-tunnel dnstt|hysteria
 - Check tunnels: sudo tunnel-healthcheck
-- Logs: journalctl -u dnstt -f $(if [[ "${INSTALL_HYSTERIA,,}" =~ ^y ]]; then echo "or journalctl -u hysteria -f"; fi)
+- Logs: journalctl -u dnstt -f $(if [[ "${INSTALL_HYSTERIA,,}" =~ ^y && -f /usr/local/bin/hysteria ]]; then echo "or journalctl -u hysteria -f"; fi)
 - DNS setup: Set NS record for $HOSTNAME to $NAMESERVER, and A record for $NAMESERVER to your server IP.
 
 Uninstallation:
-  sudo systemctl disable --now dnstt udpgw $(if [[ "${INSTALL_HYSTERIA,,}" =~ ^y ]]; then echo "hysteria"; fi)
+  sudo systemctl disable --now dnstt udpgw $(if [[ "${INSTALL_HYSTERIA,,}" =~ ^y && -f /usr/local/bin/hysteria ]]; then echo "hysteria"; fi)
   sudo rm -rf /etc/dnstt /usr/local/bin/dnstt-server /usr/bin/badvpn-udpgw \
-    /usr/local/bin/hysteria /etc/hysteria /etc/systemd/system/{dnstt,udpgw$(if [[ "${INSTALL_HYSTERIA,,}" =~ ^y ]]; then echo ",hysteria"; fi)}.service \
+    /usr/local/bin/hysteria /etc/hysteria /etc/systemd/system/{dnstt,udpgw$(if [[ "${INSTALL_HYSTERIA,,}" =~ ^y && -f /usr/local/bin/hysteria ]]; then echo ",hysteria"; fi)}.service \
     /usr/local/bin/{switch-tunnel,tunnel-healthcheck}
   sudo deluser --remove-home $SSH_USER
   sudo sed -i 's/Port $SSH_PORT/Port 22/' /etc/ssh/sshd_config
@@ -297,16 +334,18 @@ Uninstallation:
   $(if [[ "${USE_UFW,,}" =~ ^y ]]; then
     echo "sudo ufw delete allow $SSH_PORT/tcp
   sudo ufw delete allow 53/udp"
-    [[ "${INSTALL_HYSTERIA,,}" =~ ^y ]] && echo "sudo ufw delete allow $HYSTERIA_PORT/udp"
+    [[ "${INSTALL_HYSTERIA,,}" =~ ^y && -f /usr/local/bin/hysteria ]] && echo "sudo ufw delete allow $HYSTERIA_PORT/udp"
   else
     echo "sudo iptables -D INPUT -p tcp --dport $SSH_PORT -j ACCEPT
   sudo iptables -D INPUT -p udp --dport 53 -j ACCEPT"
-    [[ "${INSTALL_HYSTERIA,,}" =~ ^y ]] && echo "sudo iptables -D INPUT -p udp --dport $HYSTERIA_PORT -j ACCEPT"
+    [[ "${INSTALL_HYSTERIA,,}" =~ ^y && -f /usr/local/bin/hysteria ]] && echo "sudo iptables -D INPUT -p udp --dport $HYSTERIA_PORT -j ACCEPT"
     echo "sudo netfilter-persistent save"
   fi)
 
 For GitHub:
+  Repository: https://github.com/Humran13/SlowDNS-Setup
   Create a README.md with prerequisites, usage, and the above uninstallation steps.
+  Add MIT License (see LICENSE file).
 ==========================
 EOF
 
