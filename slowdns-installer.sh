@@ -13,7 +13,7 @@
 # - Ubuntu 20.04/22.04/24.04, root access (sudo).
 # - DNS setup: NS record for <hostname> to <nameserver>, A record for <nameserver> to server IP.
 # Usage: sudo bash install-slowdns.sh
-# Tested on Ubuntu 22.04 with DNSTT and Hysteria v2.5.0.
+# Tested on Ubuntu 24.04 with DNSTT and Hysteria v2.5.0.
 
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -44,9 +44,9 @@ check_port() {
 
 # --- Prompt for user inputs ---
 info "Enter configuration details (press Enter for defaults where applicable)."
-read -p "Hostname (e.g., yourdomain.com): " HOSTNAME
+read -p "Hostname (e.g., uk.sshmax.site): " HOSTNAME
 [[ -z "$HOSTNAME" || ! "$HOSTNAME" =~ ^[a-zA-Z0-9.-]+$ ]] && err "Invalid or empty hostname."
-read -p "Nameserver (e.g., t.yourdomain.com): " NAMESERVER
+read -p "Nameserver (e.g., uk-ns.sshmax.site): " NAMESERVER
 [[ -z "$NAMESERVER" || ! "$NAMESERVER" =~ ^[a-zA-Z0-9.-]+$ ]] && err "Invalid or empty nameserver."
 read -p "SSH username: " SSH_USER
 [[ -z "$SSH_USER" || ! "$SSH_USER" =~ ^[a-zA-Z0-9_-]+$ ]] && err "Invalid or empty username."
@@ -81,8 +81,12 @@ EXPIRES_DATE=$(date -d "+${EXPIRE_DAYS} days" "+%e %b %Y" | tr -s ' ')
 # --- Install dependencies ---
 info "Installing dependencies..."
 apt-get update -y || err "Failed to update package lists."
-apt-get install -y git build-essential golang-go wget curl ca-certificates \
-  netfilter-persistent iptables-persistent ufw net-tools || err "Failed to install dependencies."
+# Install only the firewall tool based on user choice
+if [[ "${USE_UFW,,}" =~ ^y ]]; then
+  apt-get install -y git build-essential golang-go wget curl ca-certificates ufw net-tools || err "Failed to install dependencies."
+else
+  apt-get install -y git build-essential golang-go wget curl ca-certificates netfilter-persistent iptables-persistent net-tools || err "Failed to install dependencies."
+fi
 # Verify Go version
 if ! command -v go >/dev/null 2>&1 || ! go version | grep -q "go1.[16-9]"; then
   err "Go 1.16 or higher required. Install via 'sudo apt install golang-go' or manually."
